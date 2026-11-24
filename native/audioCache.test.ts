@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
@@ -333,10 +333,13 @@ describe("audioCacheWaitFilled", () => {
 
 describe("disk cache", () => {
 	const track = audioUrl("disk/persisted/640_16.flac");
-	const trackFile = path.join(scratch, "persisted-track.flac");
+	// `audioCachePersist` records the file's name inside the cache folder, which is the path
+	// `audioCacheWaitFilled` hands out, so the fixture writes it there: anything else is not servable
+	const trackFile = path.join(cacheDir, "persisted-track.flac");
 	const trackBytes = Buffer.from("0123456789");
 
 	beforeAll(async () => {
+		await mkdir(cacheDir, { recursive: true });
 		await writeFile(trackFile, trackBytes);
 		await audioCachePersist(track, trackFile);
 	});
@@ -373,6 +376,135 @@ describe("disk cache", () => {
 
 		// A track that is already on disk needs no fetch
 		expect((await audioCacheStats()).fetching).toEqual([]);
+	});
+});
+
+describe("serving a persisted track", () => {
+	// The track the disk cache describe above persisted, read through the server for real: its file lives in the
+	// cache folder, so the url it hands out really serves the bytes
+	const url = audioUrl("disk/persisted/640_16.flac");
+	const bytes = Buffer.from("0123456789");
+
+	test("serves the file, whole and by range", async () => {
+		const cached = audioCacheUrl(url)!;
+
+		const whole = await fetch(cached);
+		expect(whole.status).toBe(200);
+		expect(whole.headers.get("content-type")).toBe("audio/flac");
+		expect(whole.headers.get("accept-ranges")).toBe("bytes");
+		// The player is told the bytes it reads are already decrypted, so it needs no key
+		expect(whole.headers.get("x-luna-decrypted")).toBe("1");
+		expect(Buffer.from(await whole.arrayBuffer()).toString()).toBe(bytes.toString());
+
+		const ranged = await fetch(cached, { headers: { Range: "bytes=2-5" } });
+		expect(ranged.status).toBe(206);
+		expect(ranged.headers.get("content-range")).toBe(`bytes 2-5/${bytes.length}`);
+		expect(Buffer.from(await ranged.arrayBuffer()).toString()).toBe("2345");
+	});
+
+	test("serves a range from the end and one without an end", async () => {
+		const cached = audioCacheUrl(url)!;
+
+		// "bytes=-2": the last two bytes
+		const suffix = await fetch(cached, { headers: { Range: "bytes=-2" } });
+		expect(suffix.status).toBe(206);
+		expect(Buffer.from(await suffix.arrayBuffer()).toString()).toBe("89");
+
+		// "bytes=7-": from byte 7 to the end
+		const openEnded = await fetch(cached, { headers: { Range: "bytes=7-" } });
+		expect(openEnded.status).toBe(206);
+		expect(openEnded.headers.get("content-range")).toBe(`bytes 7-9/${bytes.length}`);
+		expect(Buffer.from(await openEnded.arrayBuffer()).toString()).toBe("789");
+	});
+
+	test("answers 416 for a range it can't satisfy", async () => {
+		const res = await fetch(audioCacheUrl(url)!, { headers: { Range: "bytes=99-100" } });
+
+		expect(res.status).toBe(416);
+		expect(res.headers.get("content-range")).toBe(`bytes */${bytes.length}`);
+	});
+
+	test("answers HEAD with the headers and no body", async () => {
+		const res = await fetch(audioCacheUrl(url)!, { method: "HEAD" });
+
+		expect(res.status).toBe(200);
+		expect(res.headers.get("content-length")).toBe(String(bytes.length));
+		expect((await res.arrayBuffer()).byteLength).toBe(0);
+	});
+
+	test("refuses a url without the secret, and an id it doesn't have", async () => {
+		const { port, secret, id, name } = loopback(audioCacheUrl(url)!);
+
+		// Only whoever was given a url can read through the server
+		expect((await fetch(`http://127.0.0.1:${port}/not-the-secret/disk/${id}/${name}`)).status).toBe(404);
+		expect((await fetch(`http://127.0.0.1:${port}/${secret}/disk/does-not-exist/${name}`)).status).toBe(404);
+	});
+});
+
+describe("serving a track from memory", () => {
+	test("serves the bytes it holds while the track is still wanted", async () => {
+		await settle();
+		const bytes = Buffer.from("memory-served-bytes");
+		serveAudio(bytes);
+		const url = audioUrl("serving/memory/640_16.flac");
+		// Wanted, so it stays in memory rather than being freed once filled
+		audioCacheWindow([url]);
+		await until(() => audioCacheStatus(url).complete, "the track to fill in memory");
+
+		const memUrl = audioCacheUrl(url)!;
+		expect(loopback(memUrl).mode).toBe("mem");
+
+		const whole = await fetch(memUrl);
+		expect(whole.status).toBe(200);
+		expect(whole.headers.get("content-type")).toBe("audio/flac");
+		expect(Buffer.from(await whole.arrayBuffer()).toString()).toBe(bytes.toString());
+
+		const ranged = await fetch(memUrl, { headers: { Range: "bytes=7-12" } });
+		expect(ranged.status).toBe(206);
+		expect(ranged.headers.get("content-range")).toBe(`bytes 7-12/${bytes.length}`);
+		expect(Buffer.from(await ranged.arrayBuffer()).toString()).toBe("served");
+
+		audioCacheWindow([]);
+		await settle();
+	});
+
+	test("answers 404 for a memory url whose entry is gone", async () => {
+		const { port, secret } = loopback(audioCacheUrl(audioUrl("serving/gone/640_16.flac"))!);
+
+		expect((await fetch(`http://127.0.0.1:${port}/${secret}/mem/not-an-entry/640_16.flac`)).status).toBe(404);
+	});
+
+	test("waits for the bytes a read needs while the track is still arriving", async () => {
+		await settle();
+		const bytes = Buffer.from("0123456789");
+		let release = () => {};
+		const held = new Promise<void>((resolve) => (release = resolve));
+		serveAudio(bytes, (request) => {
+			// The first fetch answers the head only and holds the body open; the rest are answered normally
+			if (request.range !== "bytes=0-") return undefined;
+			return Promise.resolve({
+				status: 206,
+				headers: new Headers({ "content-range": `bytes 0-3/${bytes.length}`, "content-type": "audio/flac" }),
+				body: (async function* () {
+					yield bytes.subarray(0, 4);
+					await held;
+				})(),
+			});
+		});
+		const url = audioUrl("serving/partial/640_16.flac");
+		audioCacheWindow([url]);
+		await until(() => audioCacheStatus(url).held === 4, "the first bytes");
+
+		// A read past what is held has to wait for the rest of the track before it is answered
+		const reading = fetch(audioCacheUrl(url)!, { headers: { Range: "bytes=6-9" } });
+		release();
+		const res = await reading;
+
+		expect(res.status).toBe(206);
+		expect(Buffer.from(await res.arrayBuffer()).toString()).toBe("6789");
+
+		audioCacheWindow([]);
+		await settle();
 	});
 });
 
