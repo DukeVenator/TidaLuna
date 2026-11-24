@@ -228,4 +228,31 @@ describe("updateFormat", () => {
 		helpers.getPlaybackInfo.mockResolvedValue(undefined);
 		expect(await make().updateFormat("LOSSLESS")).toBeUndefined();
 	});
+
+	test("re-reads the byte count when forced, keeping what it already knows", async () => {
+		helpers.getPlaybackInfo.mockResolvedValue(playbackInfo("application/vnd.tidal.bts"));
+		stream.getStreamBytes.mockResolvedValue(2000);
+		// Everything it needs is cached, so only the byte count is looked up again
+		const cache = { format: { LOSSLESS: { bitDepth: 16, sampleRate: 44_100, bytes: 1000, bitrate: 500 } } } as Cache;
+
+		const format = await make({ duration: 200 }, { cache }).updateFormat("LOSSLESS", true);
+
+		expect(stream.getStreamBytes).toHaveBeenCalled();
+		expect(stream.parseStreamFormat).not.toHaveBeenCalled();
+		expect(format?.bytes).toBe(2000);
+	});
+});
+
+describe("fetchBestQuality", () => {
+	test("looks the real quality up for a spatial-only track", async () => {
+		helpers.getPlaybackInfo.mockResolvedValue(
+			playbackInfo("application/vnd.tidal.bts", { bitDepth: 24, sampleRate: 96_000, audioQuality: "HI_RES_LOSSLESS" }),
+		);
+		// A spatial track whose tags say nothing about a non-spatial quality: only playback tells what it really is
+		const cache = { format: {} } as Cache;
+		const item = make({ mediaMetadata: { tags: ["DOLBY_ATMOS"] } }, { cache });
+
+		expect(await item.fetchBestQuality()).toBe(Quality.HiRes);
+		expect(helpers.getPlaybackInfo).toHaveBeenCalled();
+	});
 });

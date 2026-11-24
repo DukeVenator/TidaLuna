@@ -5,7 +5,9 @@ import { reduxStore, resetTidalState, setTidalState } from "test/harness/tidalSt
 import type * as redux from "../../redux";
 import { MediaItem } from "./MediaItem";
 import { Quality } from "../Quality";
+import { PlayState } from "../PlayState";
 import { TidalApi } from "../TidalApi";
+import { interceptors, type LunaUnload } from "@luna/core";
 
 /**
  * `MediaItem` wraps the track TIDAL puts in its store and derives everything else from it, so these tests hand it
@@ -451,5 +453,155 @@ describe("fromId", () => {
 		]);
 		expect((dispatch.mock.calls[0][0] as DispatchedAction).payload).toEqual({ id, itemType: "track" });
 		expect(mediaItem?.tidalItem.title).toBe("Loaded");
+	});
+
+	test("suppresses TIDAL's warning when the item is no longer available", async () => {
+		const id = nextId();
+		const tidalItem = track(id);
+		const storeDispatch = reduxStore.dispatch.bind(reduxStore);
+		type DispatchedAction = { type?: string; payload?: unknown };
+		const tidalAction = (type: string) => {
+			const actionCreators = { _: (actionType: string) => (payload?: unknown) => ({ type: actionType, payload }) };
+			window.patchAction(actionCreators);
+			return actionCreators._(type);
+		};
+		let suppressed: boolean | undefined;
+		vi.spyOn(reduxStore, "dispatch").mockImplementation((action: DispatchedAction) => {
+			const result = storeDispatch(action as never);
+			if (action.type === "content/LOAD_SINGLE_MEDIA_ITEM") {
+				void Promise.resolve().then(() => {
+					// TIDAL warns while the load is in flight; loading an item on purpose suppresses that warning
+					suppressed = runInterceptors("message/MESSAGE_WARN", { message: "The content is no longer available" });
+					reduxStore.dispatch(tidalAction("content/LOAD_SINGLE_MEDIA_ITEM_SUCCESS")({ mediaItem: { type: "track", item: tidalItem } }) as never);
+				});
+			}
+			return result;
+		});
+
+		await MediaItem.fromId(id);
+
+		expect(suppressed).toBe(true);
+	});
+});
+
+/** Run the interceptors TIDAL's patched action creators would run, as navigation.test.ts does */
+const runInterceptors = (type: string, payload: unknown) => {
+	const registered = (<Record<string, Set<(payload: unknown, type: string) => unknown>>>(<unknown>interceptors))[type];
+	for (const interceptor of registered ?? []) if (interceptor(payload, type) === true) return true;
+	return false;
+};
+const listen = () => {
+	const unloads = new Set<LunaUnload>();
+	const received: MediaItem[] = [];
+	return { unloads, received };
+};
+
+describe("static construction", () => {
+	test("fromIds yields the items it finds and skips the undefined ids", async () => {
+		const first = nextId();
+		const second = nextId();
+		seedContent({
+			mediaItems: { [first]: { type: "track", item: track(first) }, [second]: { type: "track", item: track(second) } },
+		});
+
+		const items: MediaItem[] = [];
+		for await (const item of MediaItem.fromIds([first, undefined, second])) items.push(item);
+
+		expect(items.map((item) => item.id)).toEqual([first, second]);
+		// No ids at all is nothing to walk
+		for await (const item of MediaItem.fromIds(undefined)) expect(item).toBeUndefined();
+	});
+
+	test("fromTMediaItems yields the items it finds and skips the undefined entries", async () => {
+		const id = nextId();
+		seedContent({ mediaItems: { [id]: { type: "video", item: track(id) } } });
+
+		const items: MediaItem[] = [];
+		for await (const item of MediaItem.fromTMediaItems([{ item: { id }, type: "video" }, undefined])) items.push(item);
+
+		expect(items.map((item) => item.id)).toEqual([id]);
+		expect(items[0]?.contentType).toBe("video");
+	});
+
+	test("fromPlaybackContext loads the item the playback names", async () => {
+		const id = nextId();
+		seedContent({ mediaItems: { [id]: { type: "track", item: track(id) } } });
+
+		// actualVideoQuality null is a track, anything else a video
+		const mediaItem = await MediaItem.fromPlaybackContext({ actualProductId: id, actualVideoQuality: null } as unknown as redux.PlaybackContext);
+
+		expect(mediaItem?.id).toBe(id);
+		expect(mediaItem?.contentType).toBe("track");
+	});
+
+	test("fromPlaybackContext is undefined without a product to load", async () => {
+		// Nothing playing: PlayState has no context, and a context without a product names nothing to load
+		expect(await MediaItem.fromPlaybackContext()).toBeUndefined();
+		expect(await MediaItem.fromPlaybackContext({ actualProductId: undefined } as unknown as redux.PlaybackContext)).toBeUndefined();
+	});
+
+	test("fromId returns nothing for an undefined id", async () => {
+		expect(await MediaItem.fromId(undefined)).toBeUndefined();
+	});
+});
+
+describe("listeners", () => {
+	test("onPreload emits the item of a preload action", async () => {
+		const id = nextId();
+		seedContent({ mediaItems: { [id]: { type: "track", item: track(id) } } });
+		const { unloads, received } = listen();
+		MediaItem.onPreload(unloads, (item) => received.push(item));
+
+		runInterceptors("player/PRELOAD_ITEM", { productId: id, productType: "track" });
+		await vi.waitFor(() => expect(received).toHaveLength(1));
+
+		expect(received[0]?.id).toBe(id);
+	});
+
+	test("onMediaTransition emits the item and learns whether spatial audio plays", async () => {
+		const id = nextId();
+		// A spatial track: whether it really plays as one shows in the playback context, not in its tags
+		seedContent({ mediaItems: { [id]: { type: "track", item: track(id, { audioModes: ["DOLBY_ATMOS"] }) } } });
+		const { unloads, received } = listen();
+		MediaItem.onMediaTransition(unloads, (item) => received.push(item));
+
+		runInterceptors("playbackControls/MEDIA_PRODUCT_TRANSITION", {
+			playbackContext: { actualProductId: id, actualVideoQuality: null, actualAudioMode: "DOLBY_ATMOS" },
+		});
+		await vi.waitFor(() => expect(received).toHaveLength(1));
+
+		expect(received[0]?.id).toBe(id);
+		expect(MediaItem.supportsSpatialAudio).toBe(true);
+	});
+
+	test("onPreMediaTransition emits the item of a prefilled transition", async () => {
+		const id = nextId();
+		seedContent({ mediaItems: { [id]: { type: "track", item: track(id) } } });
+		const { unloads, received } = listen();
+		MediaItem.onPreMediaTransition(unloads, (item) => received.push(item));
+
+		runInterceptors("playbackControls/PREFILL_MEDIA_PRODUCT_TRANSITION", { mediaProduct: { productId: id, productType: "track" } });
+		await vi.waitFor(() => expect(received).toHaveLength(1));
+
+		expect(received[0]?.id).toBe(id);
+	});
+});
+
+describe("playback", () => {
+	test("play hands the item to PlayState", () => {
+		const play = vi.spyOn(PlayState, "play").mockReturnValue(undefined as never);
+		const mediaItem = makeMediaItem(nextId());
+
+		mediaItem.play();
+
+		expect(play).toHaveBeenCalledWith(mediaItem.id);
+	});
+
+	test("max is nothing for an item that is already the highest quality", async () => {
+		// HIRES_LOSSLESS is Quality.Max, so there is nothing better to look for
+		const mediaItem = makeMediaItem(nextId(), { mediaMetadata: { tags: ["HIRES_LOSSLESS"] } });
+
+		expect(mediaItem.bestQuality).toBe(Quality.Max);
+		expect(await mediaItem.max()).toBeUndefined();
 	});
 });
