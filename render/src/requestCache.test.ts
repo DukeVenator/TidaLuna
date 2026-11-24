@@ -3,6 +3,11 @@ import { afterAll, expect, test, vi } from "vitest";
 // The server: url path > body, every request counted
 const bodies = new Map<string, string>();
 const requests: string[] = [];
+/** Paths answered with another status, paths whose fetch rejects, paths answered as an offline miss, and their etags */
+const statuses = new Map<string, number>();
+const failing = new Set<string>();
+const offlineMiss = new Set<string>();
+const etags = new Map<string, string>();
 
 // Only the clock is faked: the module stamps entries with Date, and the settle() wait below needs real timers
 vi.useFakeTimers({ toFake: ["Date"] });
@@ -10,8 +15,17 @@ vi.stubGlobal("location", <Location>{ href: "https://desktop.tidal.com/" });
 vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
 	const url = new URL(input instanceof Request ? input.url : String(input));
 	requests.push(`${init?.method ?? (input instanceof Request ? input.method : "GET")} ${url.pathname}`);
+	if (failing.has(url.pathname)) throw new Error("network down");
+	if (offlineMiss.has(url.pathname))
+		return new Response(bodies.get(url.pathname) ?? "", { status: 200, headers: { "x-luna-offline-miss": "1" } });
+	const status = statuses.get(url.pathname);
+	if (status !== undefined) return new Response(bodies.get(url.pathname) ?? "", { status });
 	const body = bodies.get(url.pathname);
-	return body === undefined ? new Response("", { status: 404 }) : new Response(body, { headers: { "content-type": "application/json" } });
+	const etag = etags.get(url.pathname);
+	if (body === undefined) return new Response("", { status: 404 });
+	return new Response(body, {
+		headers: etag === undefined ? { "content-type": "application/json" } : { "content-type": "application/json", etag },
+	});
 });
 
 const { requestCache } = await import("./requestCache");
@@ -171,4 +185,277 @@ test("an swr rule's maxAgeMs caps how long it is served", async () => {
 	vi.advanceTimersByTime(31_000);
 	await fetch(mix);
 	expect(requests.length).toBe(2);
+});
+
+test("extraUrls fills the other urls a response also answers", async () => {
+	requestCache.clear();
+	requests.length = 0;
+	const playbackInfo = (url: URL, value: unknown) => [
+		`https://api.tidal.com/v1/playbackinfo?soundQuality=${(<{ soundQuality: string }>value).soundQuality}`,
+	];
+	requestCache.register(unloads, { pattern: /\/v1\/playbackinfo/, extraUrls: playbackInfo });
+	bodies.set("/v1/playbackinfo", `{"soundQuality":"LOSSLESS"}`);
+	const primary = "https://desktop.tidal.com/v1/playbackinfo?soundQuality=HIGH";
+
+	// Filled through the hook, so the entry keeps the raw response an alias can be served from
+	expect(await requestCache.get(primary, () => fetch(primary).then((res) => res.json()))).toEqual({ soundQuality: "LOSSLESS" });
+	await settle();
+
+	// The quality it really returned is answered from that entry, without a request of its own
+	const alias = "https://api.tidal.com/v1/playbackinfo?soundQuality=LOSSLESS";
+	expect(await requestCache.get(alias, async () => unreachable())).toEqual({ soundQuality: "LOSSLESS" });
+	expect(requests.length).toBe(1);
+});
+
+test("a request in flight for the same path answers another quality of it", async () => {
+	requestCache.clear();
+	requests.length = 0;
+	bodies.set("/v1/playbackinfo", `{"soundQuality":"LOSSLESS"}`);
+	const primary = "https://desktop.tidal.com/v1/playbackinfo?soundQuality=HIGH";
+	const first = requestCache.get(primary, () => fetch(primary).then((res) => res.json()));
+	// Let the fetcher reach the network: that is what registers the path as in flight
+	await Promise.resolve();
+	await Promise.resolve();
+
+	// Another quality of the same path waits for the first, then reads the url it answered
+	const second = requestCache.get("https://api.tidal.com/v1/playbackinfo?soundQuality=LOSSLESS", async () => unreachable());
+	expect(await first).toEqual({ soundQuality: "LOSSLESS" });
+	expect(await second).toEqual({ soundQuality: "LOSSLESS" });
+});
+
+test("a cached response that isn't a success reads as missing, or is dropped", async () => {
+	requestCache.clear();
+	requests.length = 0;
+	// 403 and 404 are TIDAL saying no: there is no value to give, and the entry stays
+	const forbidden = "https://desktop.tidal.com/v1/tracks/7?countryCode=US";
+	statuses.set("/v1/tracks/7", 403);
+	await fetch(forbidden);
+	expect(await requestCache.get(forbidden, async () => unreachable())).toBeUndefined();
+
+	// Any other status is an error, so the entry goes and the next get fetches again
+	const broken = "https://desktop.tidal.com/v1/tracks/8?countryCode=US";
+	statuses.set("/v1/tracks/8", 500);
+	await fetch(broken);
+	const fetcher = vi.fn(async () => ({ id: 8 }));
+	expect(await requestCache.get(broken, fetcher)).toEqual({ id: 8 });
+	expect(fetcher).toHaveBeenCalledTimes(1);
+});
+
+/** An swr url of its own per test, so entries from one test never answer another */
+const swrUrl = (name: string) => {
+	const path = `/v1/albums/${name}/items`;
+	requestCache.register(unloads, { pattern: new RegExp(`/v1/albums/${name}/items`), swr: true });
+	return { path, url: `https://api.tidal.com/v1/albums/${name}/items?countryCode=US` };
+};
+
+test("a re-fetch that answers an error drops the entry, so the next request goes to the network", async () => {
+	requestCache.clear();
+	requests.length = 0;
+	const { path, url } = swrUrl("6001");
+	bodies.set(path, `{"v":1}`);
+	await fetch(url);
+
+	vi.advanceTimersByTime(61_000);
+	statuses.set(path, 500);
+	// Served from the cache at once; the re-fetch behind it answers an error, so the entry is dropped
+	await fetch(url);
+	await settle();
+
+	statuses.delete(path);
+	const before = requests.length;
+	await fetch(url);
+	expect(requests.length).toBe(before + 1);
+});
+
+test("a re-fetch that throws drops the entry too", async () => {
+	requestCache.clear();
+	requests.length = 0;
+	const { path, url } = swrUrl("6002");
+	bodies.set(path, `{"v":1}`);
+	await fetch(url);
+
+	vi.advanceTimersByTime(61_000);
+	failing.add(path);
+	await fetch(url);
+	await settle();
+
+	// The network is back: the entry went with the failed re-fetch, so this asks for it again
+	failing.delete(path);
+	const before = requests.length;
+	await fetch(url);
+	expect(requests.length).toBe(before + 1);
+});
+
+test("a re-fetch answered as an offline miss leaves the entry alone", async () => {
+	requestCache.clear();
+	requests.length = 0;
+	const { path, url } = swrUrl("6003");
+	bodies.set(path, `{"v":1}`);
+	await fetch(url);
+
+	vi.advanceTimersByTime(61_000);
+	bodies.set(path, `{"v":2}`);
+	offlineMiss.add(path);
+	await fetch(url);
+	await settle();
+
+	// An offline miss is not a real answer, so the entry keeps the value it had rather than taking the miss
+	offlineMiss.delete(path);
+	expect(await (await fetch(url)).json()).toEqual({ v: 1 });
+});
+
+test("bodies that aren't json are compared as text when a re-fetch answers", async () => {
+	requestCache.clear();
+	requests.length = 0;
+	const { path, url } = swrUrl("6004");
+	bodies.set(path, "not json");
+	await fetch(url);
+
+	vi.advanceTimersByTime(61_000);
+	bodies.set(path, "also not json");
+	const changesBefore = changed.length;
+	await fetch(url);
+	await settle();
+
+	// Neither parses, so they are compared as they are: different text is a change
+	expect(changed.length).toBe(changesBefore + 1);
+});
+
+test("an entry holding an error response is re-fetched instead of served", async () => {
+	requestCache.clear();
+	requests.length = 0;
+	const { path, url } = swrUrl("6005");
+	statuses.set(path, 500);
+	await fetch(url);
+
+	// The api recovers: serving the error would keep failing until the entry aged out
+	statuses.delete(path);
+	bodies.set(path, `{"v":2}`);
+	requests.length = 0;
+	expect(await (await fetch(url)).json()).toEqual({ v: 2 });
+	expect(requests.length).toBe(1);
+	// Now a real response, it is served from the cache again
+	expect(await (await fetch(url)).json()).toEqual({ v: 2 });
+	expect(requests.length).toBe(1);
+});
+
+test("a re-fetch with the same etag counts as unchanged", async () => {
+	requestCache.clear();
+	requests.length = 0;
+	const { path, url } = swrUrl("6101");
+	etags.set(path, `W/"6101"`);
+	bodies.set(path, `{"v":1}`);
+	await fetch(url);
+
+	vi.advanceTimersByTime(61_000);
+	// The body differs, but the api says the resource is the same one
+	bodies.set(path, `{"v":1,"reordered":true}`);
+	const changesBefore = changed.length;
+	await fetch(url);
+	await settle();
+
+	expect(changed.length).toBe(changesBefore);
+});
+
+test("an alias that is already cached keeps what it has", async () => {
+	requestCache.clear();
+	requests.length = 0;
+	const alias = "https://desktop.tidal.com/v1/aliased?from=alias";
+	requestCache.register(unloads, { pattern: /\/v1\/aliased/, extraUrls: () => [alias] });
+	bodies.set("/v1/aliased", `{"v":"alias"}`);
+	await fetch(alias);
+
+	bodies.set("/v1/aliased", `{"v":"primary"}`);
+	await fetch("https://desktop.tidal.com/v1/aliased?from=primary");
+	await settle();
+
+	// The newer response did not overwrite the alias that was cached first
+	expect(await requestCache.get(alias, async () => unreachable())).toEqual({ v: "alias" });
+});
+
+test("a respond rule fetches when the entry holds no value", async () => {
+	requestCache.clear();
+	requests.length = 0;
+	const path = "/v1/videos/7001/playbackinfo";
+	const url = "https://desktop.tidal.com/v1/videos/7001/playbackinfo?q=HIGH";
+	requestCache.register(unloads, { pattern: /\/v1\/videos\/7001\/playbackinfo/, respond: (value) => value });
+
+	// A 404 is cached as an entry without a value
+	statuses.set(path, 404);
+	await fetch(url);
+	requests.length = 0;
+
+	// Nothing to answer with, so it asks the network
+	statuses.delete(path);
+	bodies.set(path, `{"id":1}`);
+	expect(await (await fetch(url)).json()).toEqual({ id: 1 });
+	expect(requests.length).toBe(1);
+});
+
+test("a respond rule fetches when its entry can't be read", async () => {
+	requestCache.clear();
+	requests.length = 0;
+	const path = "/v1/videos/7002/playbackinfo";
+	const url = "https://desktop.tidal.com/v1/videos/7002/playbackinfo?q=HIGH";
+	requestCache.register(unloads, { pattern: /\/v1\/videos\/7002\/playbackinfo/, respond: (value) => value });
+
+	// Cached, but the body doesn't parse: reading the entry rejects
+	bodies.set(path, "not json");
+	await fetch(url);
+	requests.length = 0;
+
+	bodies.set(path, `{"id":2}`);
+	expect(await (await fetch(url)).json()).toEqual({ id: 2 });
+	expect(requests.length).toBe(1);
+});
+
+test("a respond rule reads its headers from a Request", async () => {
+	requestCache.clear();
+	requests.length = 0;
+	const path = "/v1/videos/7003/playbackinfo";
+	requestCache.register(unloads, {
+		pattern: /\/v1\/videos\/7003\/playbackinfo/,
+		respond: (value, headers) => ({ ...(<object>value), session: headers.get("x-session") }),
+	});
+	bodies.set(path, `{"id":3}`);
+	// Filled first: a respond rule answers from an entry, it doesn't fill one
+	await fetch("https://desktop.tidal.com/v1/videos/7003/playbackinfo?q=HIGH");
+
+	// A Request carries its own headers, and its own url and method
+	const res = await fetch(new Request("https://desktop.tidal.com/v1/videos/7003/playbackinfo?q=HIGH", { headers: { "x-session": "abc" } }));
+	expect(await res.json()).toEqual({ id: 3, session: "abc" });
+});
+
+test("a Request is served from the cache like a url string", async () => {
+	requestCache.clear();
+	requests.length = 0;
+	const { path, url } = swrUrl("7101");
+	bodies.set(path, `{"v":1}`);
+	await fetch(url);
+	requests.length = 0;
+
+	// happy-dom drops a Request's `cache`, so only the default mode can be exercised here: it is served from the cache
+	expect(await (await fetch(new Request(url))).json()).toEqual({ v: 1 });
+	expect(requests.length).toBe(0);
+});
+
+test("a request no rule covers, and a mutation to another host, are passed through", async () => {
+	requestCache.clear();
+	requests.length = 0;
+
+	await fetch("https://example.com/nothing");
+	await fetch("https://example.com/collect", { method: "POST" });
+
+	expect(requests).toEqual(["GET /nothing", "POST /collect"]);
+});
+
+// Last: it unloads every rule and listener this file registered, so nothing after it can rely on the cache
+test("with no rules registered the hook stays out of the way", async () => {
+	requestCache.clear();
+	requests.length = 0;
+	for (const unload of [...unloads]) unload();
+
+	await fetch("https://example.com/after-unload");
+
+	expect(requests).toEqual(["GET /after-unload"]);
 });
