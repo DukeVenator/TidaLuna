@@ -1,10 +1,10 @@
-import { mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, test, vi, type MockInstance } from "vitest";
 
 import { setUserDataDir } from "../test/harness/electron";
-import { staleIfError } from "./offlineCache";
+import { offlineCacheSetLimit, offlineCacheStats, staleIfError } from "./offlineCache";
 
 /**
  * `native/offlineCache.ts` keeps the last good GET response on disk and hands it back when the network fails, so TIDAL
@@ -380,5 +380,96 @@ describe("offlineCache staleIfError", () => {
 				expect(await (await staleIfError(url, failing(), req)).json()).toEqual({ favorites: ["anon"] });
 			}
 		});
+	});
+});
+
+describe("offlineCache pruning", () => {
+	let userData: string;
+	let cacheDir: string;
+
+	/** Keeps one response for a url ending in `name`, the same way the page's own load does */
+	const keep = async (name: string) => {
+		await keepOnline(`https://api.tidal.com/v1/${name}`, () => jsonOf({ name }));
+	};
+	/** Every kept entry, as the files it is made of: a body and its sidecar */
+	const entries = async () => {
+		const kept: { key: string; url: string }[] = [];
+		for (const metaName of await metaFiles(userData)) {
+			const key = metaName.replace(/\.json$/, "");
+			const meta = JSON.parse(await readFile(path.join(cacheDir, metaName), "utf8")) as KeptMeta;
+			kept.push({ key, url: meta.url });
+		}
+		return kept;
+	};
+
+	beforeEach(async () => {
+		userData = await mkdtemp(path.join(os.tmpdir(), "luna-offline-cache-prune-"));
+		setUserDataDir(userData);
+		cacheDir = cacheDirOf(userData);
+		vi.spyOn(console, "warn").mockImplementation(() => {});
+		vi.spyOn(console, "error").mockImplementation(() => {});
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		// Back to the default limit for the tests that share this module
+		await offlineCacheSetLimit(undefined);
+		await rm(userData, { recursive: true, force: true });
+	});
+
+	// The module counts the folder once and then tracks what it writes, so only the first prune in this file can be the
+	// lazy one stats does. This test is first for that reason; the ones after it force a recount with setLimit.
+	test("the first stats call counts the folder, later ones use what was counted", async () => {
+		await keep("stats/one");
+		await waitForKept(userData);
+
+		const stats = await offlineCacheStats();
+
+		expect(stats.path).toBe(cacheDir);
+		expect(stats.limit).toBe(1024 ** 3);
+		expect(stats.userLimit).toBeUndefined();
+		expect(stats.usage).toBeGreaterThan(0);
+	});
+
+	test("setLimit prunes the least recently used entries first", async () => {
+		for (const name of ["oldest", "middle", "newest"]) await keep(`prune/${name}`);
+		await waitForKept(userData, 3);
+
+		// Age the entries, so which one is least recently used is known: "oldest" three hours back, "newest" one
+		const order = ["oldest", "middle", "newest"];
+		for (const { key, url } of await entries()) {
+			const age = (order.length - order.findIndex((name) => url.endsWith(name))) * 60 * 60_000;
+			const when = new Date(Date.now() - age);
+			await utimes(path.join(cacheDir, key), when, when);
+			await utimes(path.join(cacheDir, key + ".json"), when, when);
+		}
+
+		// Counts this test's folder: the total counted so far belongs to another one
+		await offlineCacheSetLimit(undefined);
+		const { usage } = await offlineCacheStats();
+		await offlineCacheSetLimit(usage - 1);
+
+		const left = (await entries()).map(({ url }) => url);
+		expect(left).toHaveLength(2);
+		expect(left.some((url) => url.endsWith("oldest"))).toBe(false);
+		expect((await offlineCacheStats()).limit).toBe(usage - 1);
+	});
+
+	test("drops a part file a cut off write left behind, and counts a live one", async () => {
+		await mkdir(cacheDir, { recursive: true });
+		const abandoned = path.join(cacheDir, "abandoned.1.part");
+		const writing = path.join(cacheDir, "writing.2.part");
+		await writeFile(abandoned, Buffer.alloc(5, 1));
+		await writeFile(writing, Buffer.alloc(7, 2));
+		// A write older than an hour was cut off by a crash or a full disk; a recent one is still going
+		const old = new Date(Date.now() - 2 * 60 * 60_000);
+		await utimes(abandoned, old, old);
+
+		// Forced, so this folder is counted rather than the one before it
+		await offlineCacheSetLimit(undefined);
+		const stats = await offlineCacheStats();
+
+		expect(await listCache(userData)).toEqual(["writing.2.part"]);
+		expect(stats.usage).toBe(7);
 	});
 });
