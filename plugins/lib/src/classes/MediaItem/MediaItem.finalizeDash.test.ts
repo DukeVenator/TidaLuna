@@ -343,7 +343,7 @@ describe("finalizeDashDownload", () => {
 		expect(tags).toEqual({ title: "Track Title", performers: ["Artist One", "Artist Two"], album: "Album Title", year: 1998 });
 	});
 
-	test("an AAC encoder delay in the source is carried into the muxed file as an edit list", async () => {
+	test("an AAC encoder delay in the source survives the remux as an edit list", async () => {
 		const path = join(dir, "delay.m4a");
 		// A DASH AAC stream normally starts with an edit list trimming the encoder's priming samples
 		await writeFile(path, insertBox(await cmafAac(40), ["moov", "trak"], "tkhd", editListBox(1, 1024)));
@@ -351,6 +351,9 @@ describe("finalizeDashDownload", () => {
 		await finalizeDashDownload(path);
 
 		const file = await readFile(path);
+		// The muxer carries the source's edit list through, so this asserts what the download really gets. The remuxer
+		// can also build one (`patchMoov`'s edts branch), but only for a source the muxer drops it from: with mediabunny
+		// copying it, that fallback never runs, and it is covered by nothing until a source like that turns up.
 		const edts = findPath(file, ["moov", "trak", "edts"]);
 		expect(edts).toBeDefined();
 		const elst = boxesIn(file, edts!.start + 8, edts!.start + edts!.size).find((box) => box.type === "elst");
@@ -365,6 +368,18 @@ describe("finalizeDashDownload", () => {
 		const firstChunkOffset = file.readUInt32BE(stco!.start + 16);
 		expect(firstChunkOffset).toBeGreaterThanOrEqual(mdat.start);
 		expect(firstChunkOffset).toBeLessThan(mdat.start + mdat.size);
+	});
+
+	test("tags without a year or a date leave the year unset", async () => {
+		const path = join(dir, "no-year.m4a");
+		await writeFile(path, await cmafAac(8));
+
+		// Neither a year tag nor a date to take one from
+		await finalizeDashDownload(path, metaTags({ year: undefined, date: undefined }, false));
+
+		const tags = readTags(path, "taglib/m4a", (tag) => ({ title: tag.title, year: tag.year }));
+		expect(tags.title).toBe("Track Title");
+		expect(tags.year).toBe(0);
 	});
 
 	test("a download with no tags is still remuxed", async () => {
